@@ -1,4 +1,4 @@
-import { BookingStatus, ClassType, Gender, PassengerStatus, PaymentStatus } from '@prisma/client';
+import { BookingStatus, ClassType, Gender, PassengerStatus, PaymentStatus, Prisma } from '@prisma/client';
 import { prisma } from '../config/prisma';
 
 export const bookingRepository = {
@@ -46,6 +46,32 @@ export const bookingRepository = {
         },
         payments: {
           select:  { id: true, status: true, amount: true },
+          orderBy: { createdAt: 'desc' },
+          take:    1,
+        },
+      },
+    });
+  },
+
+  // Cancellation lookup — needs each passenger's pre-cancel status + position fields
+  // so the promotion engine knows what slots are being freed. Includes the latest
+  // payment (to flip it REFUNDED).
+  findByPnrForCancel(pnr: string) {
+    return prisma.booking.findUnique({
+      where: { pnr },
+      include: {
+        passengers: {
+          select: {
+            id:               true,
+            status:           true,
+            seatId:           true,
+            classType:        true,
+            racPosition:      true,
+            waitlistPosition: true,
+          },
+        },
+        payments: {
+          select:  { id: true },
           orderBy: { createdAt: 'desc' },
           take:    1,
         },
@@ -110,17 +136,28 @@ export const bookingRepository = {
     });
   },
 
-  // Atomically creates a booking + passengers (with assigned seats) + mock payment.
-  // Returns the booking with passengers and seat info for the service to shape the response.
+  // Atomically creates a booking + passengers + mock payment.
+  // Each passenger carries its own allocated status / seat / queue position
+  // (produced by allocationService), so the booking can be a mix of CNF/RAC/WL.
   async createBookingTx(data: {
-    pnr:         string;
-    userId:      string;
-    trainId:     string;
-    journeyDate: Date;
-    fromStopId:  string;
-    toStopId:    string;
-    totalFare:   number;
-    passengers:  Array<{ name: string; age: number; gender: Gender; seatId: string }>;
+    pnr:           string;
+    userId:        string;
+    trainId:       string;
+    journeyDate:   Date;
+    fromStopId:    string;
+    toStopId:      string;
+    totalFare:     number;
+    bookingStatus: BookingStatus;
+    classType:     ClassType;
+    passengers:    Array<{
+      name:             string;
+      age:              number;
+      gender:           Gender;
+      status:           PassengerStatus;
+      seatId:           string | null;
+      racPosition:      number | null;
+      waitlistPosition: number | null;
+    }>;
   }) {
     return prisma.$transaction(async (tx) => {
       const booking = await tx.booking.create({
@@ -131,25 +168,30 @@ export const bookingRepository = {
           journeyDate: data.journeyDate,
           fromStopId:  data.fromStopId,
           toStopId:    data.toStopId,
-          status:      BookingStatus.CONFIRMED,
+          status:      data.bookingStatus,
           totalFare:   data.totalFare,
           passengers: {
             create: data.passengers.map((p) => ({
-              name:   p.name,
-              age:    p.age,
-              gender: p.gender,
-              seatId: p.seatId,
-              status: PassengerStatus.CONFIRMED,
+              name:             p.name,
+              age:              p.age,
+              gender:           p.gender,
+              seatId:           p.seatId,
+              status:           p.status,
+              classType:        data.classType,
+              racPosition:      p.racPosition,
+              waitlistPosition: p.waitlistPosition,
             })),
           },
         },
         include: {
           passengers: {
             select: {
-              name:   true,
-              age:    true,
-              gender: true,
-              status: true,
+              name:             true,
+              age:              true,
+              gender:           true,
+              status:           true,
+              racPosition:      true,
+              waitlistPosition: true,
               seat: {
                 select: {
                   seatNumber: true,
@@ -174,8 +216,15 @@ export const bookingRepository = {
     });
   },
 
-  // Atomically flips booking + all passengers → CANCELLED, payment → REFUNDED.
-  async cancelBookingTx(bookingId: string, paymentId: string) {
+  // Atomically flips booking + all passengers → CANCELLED, payment → REFUNDED,
+  // then runs `onCancelled` inside the SAME transaction so the promotion chain
+  // (RAC→CNF, WL→RAC) is atomic with the cancellation. A half-applied promotion
+  // would be corruption — hence one transaction boundary for the whole operation.
+  async cancelBookingTx(
+    bookingId:   string,
+    paymentId:   string,
+    onCancelled: (tx: Prisma.TransactionClient) => Promise<void>,
+  ) {
     return prisma.$transaction(async (tx) => {
       await tx.bookingPassenger.updateMany({
         where: { bookingId },
@@ -189,6 +238,7 @@ export const bookingRepository = {
         where: { id: paymentId },
         data:  { status: PaymentStatus.REFUNDED },
       });
+      await onCancelled(tx);
     });
   },
 };

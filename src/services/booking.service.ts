@@ -1,12 +1,23 @@
 // TODO(DJ): rewrite create() and cancel() yourself before interviews.
 // These are the methods interviewers will ask you to walk through line by line.
-import { BerthType, BookingStatus, ClassType } from '@prisma/client';
+import { BerthType, BookingStatus, ClassType, Gender, PassengerStatus } from '@prisma/client';
 import { PrismaClientKnownRequestError } from '@prisma/client/runtime/library';
 import { z } from 'zod';
 import { bookingRepository } from '../repositories/booking.repository';
 import { trainRepository } from '../repositories/train.repository';
+import { allocationService } from './allocation.service';
+import { promotionService } from './promotion.service';
 import { ForbiddenError, NotFoundError, ConflictError, BadRequestError } from '../errors/AppError';
 import { createBookingSchema } from '../validators/booking.validators';
+
+// Order cancelled passengers process in: confirmed seats free first (they trigger
+// the longest promotion chain), then RAC slots, then plain waitlist gap-closing.
+const CANCEL_ORDER: Record<PassengerStatus, number> = {
+  [PassengerStatus.CONFIRMED]:  0,
+  [PassengerStatus.RAC]:        1,
+  [PassengerStatus.WAITLISTED]: 2,
+  [PassengerStatus.CANCELLED]:  3,
+};
 
 // Fare in paise per km
 const FARE_RATE: Record<ClassType, number> = {
@@ -97,28 +108,26 @@ export const bookingService = {
       throw new BadRequestError('BAD_ROUTE', `${data.fromStation} does not come before ${data.toStation} on this train`);
     }
 
-    const journeyDate  = parseDate(data.journeyDate);
-    const classType    = API_CLASS_TO_PRISMA[data.classType];
+    const journeyDate    = parseDate(data.journeyDate);
+    const classType      = API_CLASS_TO_PRISMA[data.classType];
     const passengerCount = data.passengers.length;
 
-    // 4–5. Availability check (check-then-act — intentional race condition, fixed in Phase 4)
-    const freeSeats = await bookingRepository.findFreeSeats(train.id, journeyDate, classType, passengerCount);
-    if (freeSeats.length < passengerCount) {
-      throw new ConflictError('SEAT_UNAVAILABLE', `Not enough ${data.classType} seats available on ${data.journeyDate}`);
-    }
+    // 4–5. Allocate each passenger to CONFIRMED / RAC / WAITLISTED.
+    // allocationService owns the fill order + berth preference + WL cap; it throws
+    // WAITLIST_FULL (409) if the booking can't fit. The check-then-act race lives
+    // inside it now (free seats are read, then written in a separate tx) — Phase 4.
+    const { bookingStatus, allocations } = await allocationService.allocate(
+      train.id,
+      journeyDate,
+      classType,
+      data.passengers.map((p) => ({ name: p.name, age: p.age, gender: p.gender as Gender })),
+    );
 
-    // 6. Fare calculation
+    // 6. Fare calculation — every passenger pays; WL/RAC are refunded on cancel.
     const distanceKm = toStop.distanceKm - fromStop.distanceKm;
     const totalFare  = distanceKm * FARE_RATE[classType] * passengerCount;
 
     // 7–8. Generate PNR, retry on the astronomically rare unique collision
-    const passengersWithSeats = data.passengers.map((p, i) => ({
-      name:   p.name,
-      age:    p.age,
-      gender: p.gender as 'M' | 'F' | 'O',
-      seatId: freeSeats[i].id,
-    }));
-
     let booking;
     for (let attempt = 0; attempt < 5; attempt++) {
       try {
@@ -130,7 +139,9 @@ export const bookingService = {
           fromStopId:  fromStop.id,
           toStopId:    toStop.id,
           totalFare,
-          passengers:  passengersWithSeats,
+          bookingStatus,
+          classType,
+          passengers:  allocations,
         });
         break;
       } catch (err) {
@@ -147,17 +158,19 @@ export const bookingService = {
       status:     booking.status,
       totalFare:  booking.totalFare,
       passengers: booking.passengers.map((p) => ({
-        name:   p.name,
-        age:    p.age,
-        gender: p.gender,
-        status: p.status,
-        seat:   formatSeat(p.seat),
+        name:             p.name,
+        age:              p.age,
+        gender:           p.gender,
+        status:           p.status,
+        seat:             formatSeat(p.seat),
+        racPosition:      p.racPosition,
+        waitlistPosition: p.waitlistPosition,
       })),
     };
   },
 
   async cancel(userId: string, pnr: string) {
-    const booking = await bookingRepository.findByPnr(pnr);
+    const booking = await bookingRepository.findByPnrForCancel(pnr);
     if (!booking) throw new NotFoundError('Booking');
     if (booking.userId !== userId) throw new ForbiddenError('You do not own this booking');
     if (booking.status === BookingStatus.CANCELLED) {
@@ -165,7 +178,34 @@ export const bookingService = {
     }
 
     const payment = booking.payments[0];
-    await bookingRepository.cancelBookingTx(booking.id, payment.id);
+
+    // Capture each passenger's PRE-cancel state, ordered so confirmed seats free
+    // before RAC slots. The cancel tx flips these rows to CANCELLED, then we run
+    // the promotion chain for each — all inside one transaction (see repository).
+    const toPromote = booking.passengers
+      .filter((p) => p.status !== PassengerStatus.CANCELLED)
+      .sort((a, b) => CANCEL_ORDER[a.status] - CANCEL_ORDER[b.status]);
+
+    await bookingRepository.cancelBookingTx(booking.id, payment.id, async (tx) => {
+      for (const p of toPromote) {
+        // classType is null only for pre-Phase-2 rows; promotion can't be scoped
+        // without it, so skip (those bookings predate the waitlist mechanism).
+        if (!p.classType) continue;
+        await promotionService.runAfterCancellation(
+          booking.trainId,
+          booking.journeyDate,
+          {
+            id:               p.id,
+            status:           p.status,
+            seatId:           p.seatId,
+            classType:        p.classType,
+            racPosition:      p.racPosition,
+            waitlistPosition: p.waitlistPosition,
+          },
+          tx,
+        );
+      }
+    });
 
     return { pnr: booking.pnr, status: BookingStatus.CANCELLED };
   },
