@@ -150,3 +150,79 @@ The client never sends a fare amount. The server fetches `distanceKm = toStop.di
 
 **Known race condition (intentional — see Phase 4)**
 Steps "find free seats" then "create booking" are two separate DB operations with no lock between them. Two concurrent requests can both read the same seat as free and both succeed. This is left in deliberately. Phase 4 fixes it via pessimistic locking (`SELECT … FOR UPDATE`), optimistic locking (the `seats.version` column), and Redis distributed locks — then benchmarks all three. The story "I shipped it naive, reproduced the race, then fixed it three ways" is the strongest thing you can say in a senior backend interview.
+
+## Architecture Decisions — Phase 2
+
+Phase 2 replaces Phase 1's "grab any free seat" with real railway semantics: a seat-allocation algorithm, RAC (Reservation Against Cancellation), a waiting list with positions, a per-passenger state machine, automatic promotions on cancellation, and a public PNR status endpoint. Every schema change is **additive** — no Phase 1 table was rewritten, which was the whole point of the Phase 1 design.
+
+### Step (a) — Coach Class Config + Passenger Position Columns
+
+**`coach_class_configs` table holds the per-class quotas**
+One row per `(train_id, class_type)` stores `rac_capacity` (how many RAC passenger slots) and `max_waitlist` (the hard cap beyond which a booking is refused). These are policy numbers, not physical inventory, so they belong in their own configurable table rather than hardcoded in the allocation logic. The allocation algorithm reads this row before accepting any booking.
+
+**`waitlist_position` and `rac_position` are nullable columns on `booking_passengers`**
+Exactly one is non-null depending on status: a WAITLISTED passenger has a `waitlist_position`, an RAC passenger has a `rac_position`, a CONFIRMED passenger has neither. No separate queue table — the position *is* a column on the passenger row, which keeps promotion a simple `UPDATE` rather than a cross-table move.
+
+**Deviation from plan: `class_type` column added to `booking_passengers`**
+The plan listed only the two position columns. But a WAITLISTED passenger has `seat_id = NULL`, so their travel class can't be inferred from the seat relationship — yet every WL/RAC query must be scoped *by class* (SL waitlist is independent of 2A waitlist). The fix is a nullable `class_type` column on the passenger row, set at booking time. Nullable because pre-Phase-2 confirmed rows predate it; promotion simply skips any passenger with a null class. This was flagged as a deviation and is documented here as the reasoning.
+
+### Step (b) — PassengerStateMachine (the "state machine" interview answer)
+
+**One enforcement point for every status change**
+`PassengerStateMachine.transition(from, to)` throws `BadRequestError('INVALID_STATUS_TRANSITION')` unless the move is legal. Legal moves: `WAITLISTED → RAC`, `RAC → CONFIRMED`, and `any → CANCELLED`. Illegal: `WAITLISTED → CONFIRMED` directly (you must step through RAC), any backwards move, and anything out of `CANCELLED` (terminal). Centralising this means the promotion engine, cancellation, and any future code all share one definition of "what's allowed" — you can't accidentally promote a waitlisted passenger straight to confirmed from one code path and not another.
+
+**Why model it explicitly instead of scattering `if` checks**
+A booking's lifecycle is a finite-state machine; encoding the legal-transition table as data (`Record<Status, Set<Status>>`) makes the rules auditable at a glance and unit-testable in isolation (14 tests cover every legal and illegal pair). When an interviewer asks "where did you use a state machine?", this is a concrete, defensible answer.
+
+### Step (c) — Seat Allocation Algorithm
+
+**Fill order: CONFIRMED → RAC → WAITLISTED → refuse**
+For each passenger the algorithm tries a confirmed seat first; if seats are exhausted it tries an RAC slot; if RAC is full it assigns a waitlist position; if the waitlist is at `max_waitlist` it throws `ConflictError('WAITLIST_FULL')` (409). This mirrors how real reservation works.
+
+**SIDE_LOWER berths are reserved for RAC and excluded from the confirmed pool**
+`findFreeSeats` excludes `SIDE_LOWER`; `findRacSeatOccupancy` returns *only* `SIDE_LOWER` seats with their current occupancy. In real Indian Railways, two RAC passengers share one side-lower berth — so RAC capacity is modelled as "2 passengers per side-lower berth", and the algorithm never lets a third passenger onto a berth.
+
+**Seniors (age ≥ 60) are sorted first for LOWER-berth preference**
+Passengers are sorted seniors-first before allocation so a senior gets first pick of a `LOWER` berth, then the original order is restored in the result. This matches the real-world lower-berth preference for senior citizens without changing the order the client sees back.
+
+**The check-then-act race now lives in `allocationService`**
+Reading free seats and then writing the booking are still two separate steps with no lock — the Phase 1 race condition moved here intact, by design. Rule 5 keeps it until Phase 4.
+
+### Step (d) — Promotion Engine (runs inside the cancellation transaction)
+
+**The cascade: CONFIRMED freed → RAC promoted → WL promoted**
+When a confirmed seat is cancelled, the lowest-positioned RAC passenger is promoted to CONFIRMED and takes the freed seat; that vacates their side-lower berth slot, so the lowest-positioned WL passenger is promoted to RAC onto it. Cancelling an RAC slot promotes the top WL passenger directly. Cancelling a WL passenger just closes the gap (decrement positions behind them). Every status change calls `PassengerStateMachine.transition`, so the invariant holds even inside promotion.
+
+**Why it must run inside the cancellation transaction**
+A half-applied promotion chain is corruption: a confirmed seat freed but the RAC passenger not promoted leaves a phantom-empty seat and a stuck queue. The repository's `cancelBookingTx` takes an `onCancelled(tx)` callback and runs the promotion inside the same `prisma.$transaction` as the cancel — atomic by construction. This is the "how do you keep a multi-step operation consistent?" interview answer: transaction boundaries.
+
+**Positions are decremented behind the change, not fully recomputed**
+Promotion shifts only the positions *greater than* the freed one (`updateMany … position > N → decrement 1`), rather than re-numbering the whole queue. Cheaper, and the promotion *decision* always re-queries the lowest live position via `orderBy position asc`, so even if numbers briefly have gaps the right passenger is always next.
+
+**Known limitation (documented):** cancelling a whole booking that mixes CONFIRMED + RAC passengers can make the *displayed* RAC numbers drift by one, because each passenger's pre-cancel position goes stale after the previous one in the same cancel renumbers. It's cosmetic — promotion decisions stay correct since queries pick the lowest live position. Candidate for tightening when the allocation/promotion code is rewritten.
+
+### Step (e) — Public PNR Status Endpoint
+
+**`GET /api/v1/pnr/:pnr` is public — no auth, like real IRCTC**
+Anyone with a PNR can check its status; that's how the real system works. It's a separate router from `/bookings` (which is fail-closed behind `requireAuth`) precisely so it stays outside the auth wall. It also uses a dedicated `findByPnrPublic` repository method that omits payment details — a public status check has no business returning payment rows.
+
+**Berth string formatted per status**
+The response formats each passenger as IRCTC does: `S2/34 LOWER` when confirmed, `RAC 3` when RAC, `WL 7` when waitlisted. The formatting lives in the controller (an HTTP-presentation concern), not the service.
+
+### Step (f) — Wiring Allocation + Promotion into Booking Flows
+
+**`createBookingTx` now persists per-passenger status, seat, and positions**
+A booking is no longer uniformly CONFIRMED — it can be CONFIRMED, RAC, WAITLISTED, or `PARTIALLY_CONFIRMED` (a mix). The booking-level status is derived from the set of passenger statuses. This is exactly the per-passenger-status schema decision from Phase 1 paying off: zero rewrite, just richer data in the same columns.
+
+**Cancellation orders passengers CONFIRMED → RAC → WAITLISTED before promoting**
+Freeing confirmed seats first triggers the longest promotion chains, so they're processed first. The service captures each passenger's *pre-cancel* state (the cancel itself flips the rows to CANCELLED), then runs the promotion for each inside the transaction callback.
+
+### Step (g) — Edge-Case Tests
+
+**30 unit tests, no database required**
+`allocationService` is tested by mocking its repository; `promotionService` by passing a fully-mocked transaction client. Coverage matches the plan's edge-case list: RAC 2-per-berth sharing (never a 3rd), `racCapacity` cap, CNF+RAC+WL → `PARTIALLY_CONFIRMED`, waitlist position continuation, `WAITLIST_FULL` 409, the full RAC→CNF→WL promotion cascade, waitlist gap-closing, and the side-lower berth guard. Because both services are pure logic over injected dependencies, the tests are fast and deterministic.
+
+### Cross-cutting fix — unique `(coach_id, seat_number)` on `seats`
+
+**A non-idempotent seed had duplicated every physical seat**
+The seed used `createMany({ skipDuplicates: true })`, but `skipDuplicates` only skips rows that violate a **unique constraint** — and `seats` had none on `(coach_id, seat_number)`. So each re-run inserted a fresh set of seats with new UUIDs, silently doubling inventory. Allocation then handed out two distinct rows that were really the same physical seat. Adding `@@unique([coachId, seatNumber])` makes the seed genuinely idempotent and prevents recurrence. Lesson worth stating in interviews: *`skipDuplicates` is a no-op without a constraint to act on — idempotency must be enforced by the schema, not assumed by the loader.*
