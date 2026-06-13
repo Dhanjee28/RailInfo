@@ -119,3 +119,34 @@ The search finds all trains that stop at any of the two station codes, then filt
 
 **`@types/express@5` widens `req.params` values to `string | string[]`**
 In Express 5's type definitions, `ParamsDictionary` is `{ [key: string]: string | string[] }` (Express 4 was `string` only). Route params are always single strings at runtime, so the cast `req.params.trainNumber as string` is safe — but it's a detail to know when migrating type definitions.
+
+### Step (f) — Booking History + Booking Detail (Read Paths)
+
+**`router.use(requireAuth)` applied once at the router level**
+Every booking route is authenticated. Applying `requireAuth` once via `router.use()` is cleaner than repeating it on each individual route — and guarantees no route is accidentally left public. This is a "fail closed" posture: new routes added to the booking router are protected by default without any extra ceremony.
+
+**List vs detail have different response shapes by design**
+The history endpoint (`GET /bookings`) uses Prisma `_count` to get the passenger count — it never fetches the passenger rows themselves. This keeps the list response lean (one row per booking) and avoids loading potentially large relation sets just to count them. The detail endpoint (`GET /bookings/:pnr`) fetches full passenger + seat + payment data because you've already drilled in and need everything. This split is what makes list views fast even with many bookings.
+
+**Ownership check happens in the service, not a middleware**
+`bookingService.getDetail` fetches the booking by PNR and then checks `booking.userId !== userId`. Doing this in middleware would require a second DB fetch (middleware doesn't know the booking yet). Doing it in the service reuses the fetch that would happen anyway. ADMIN bypass — where admins can view any booking — is deliberately deferred to Phase 3 RBAC; when it arrives, only this one check needs a role-aware branch.
+
+**`journeyDate` serialised as `YYYY-MM-DD` string, never ISO timestamp**
+The column is a `DATE` in PostgreSQL (no time component). Serialising with `.toISOString()` would produce `"2026-07-01T00:00:00.000Z"`, which leaks an artificial midnight UTC time. Slicing at `'T'` gives a clean date-only string that matches what the client sent during search — same shape in and out.
+
+### Step (g) — Booking Creation + Cancellation
+
+**Cancellation is `POST /bookings/:pnr/cancel`, not `DELETE /bookings/:pnr`**
+Cancellation is a state transition with side-effects (refund, and in Phase 2, waiting-list promotions). Modelling it as `DELETE` implies the resource is destroyed — but bookings are never hard-deleted; they stay as audit history with status `CANCELLED`. A `POST` action route makes the intent explicit and is safer to extend (Phase 2 adds WL promotion logic inside the same action).
+
+**`prisma.$transaction` in the repository, not the service**
+The create and cancel transactions are owned by the repository, not the service. The service decides *what* to create; the repository decides *how* to persist it atomically. Calling `prisma.$transaction` in the service would be a Prisma call outside the repository layer — a layering violation. Keeping it in the repository means the service can be unit-tested by mocking the repository, with no Prisma dependency.
+
+**PNR retry loop for uniqueness collisions**
+`generatePnr()` produces a random 10-char alphanumeric string. The probability of collision is ~1 in 36^10 (~3.7 trillion) per booking — effectively zero. But the Prisma `P2002` unique-constraint error is caught and retried up to 5 times rather than crashing. This is the correct pattern: design for the overwhelmingly common case, handle the edge case gracefully without over-engineering.
+
+**Fare is computed server-side from distance × class rate × passenger count**
+The client never sends a fare amount. The server fetches `distanceKm = toStop.distanceKm - fromStop.distanceKm` from the seed data and multiplies by a fixed rate table (paise per km). Trusting client-sent amounts would allow users to pay whatever they want — computing server-side is the only correct approach. Rates are hardcoded for Phase 1; a `fare_rules` table is future scope.
+
+**Known race condition (intentional — see Phase 4)**
+Steps "find free seats" then "create booking" are two separate DB operations with no lock between them. Two concurrent requests can both read the same seat as free and both succeed. This is left in deliberately. Phase 4 fixes it via pessimistic locking (`SELECT … FOR UPDATE`), optimistic locking (the `seats.version` column), and Redis distributed locks — then benchmarks all three. The story "I shipped it naive, reproduced the race, then fixed it three ways" is the strongest thing you can say in a senior backend interview.
