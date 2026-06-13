@@ -152,6 +152,9 @@ model Seat {
 
   passengers BookingPassenger[]
 
+  // A physical seat is unique by its coach + number. Also makes the seed's
+  // createMany({ skipDuplicates: true }) genuinely idempotent on re-runs.
+  @@unique([coachId, seatNumber])
   @@map("seats")
 }
 
