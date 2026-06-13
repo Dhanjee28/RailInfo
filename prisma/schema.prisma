@@ -1,0 +1,211 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ─── Enums ────────────────────────────────────────────────────────────────────
+
+enum Role {
+  USER
+  ADMIN
+}
+
+// Prisma enum names can't start with digits; @map stores the real DB value ("3A" etc.)
+enum ClassType {
+  SL
+  THREE_A @map("3A")
+  TWO_A   @map("2A")
+  FIRST_A @map("1A")
+
+  @@map("ClassType")
+}
+
+enum BerthType {
+  LOWER
+  MIDDLE
+  UPPER
+  SIDE_LOWER
+  SIDE_UPPER
+}
+
+// BookingStatus includes Phase-2 states (WAITLISTED, RAC, PARTIALLY_CONFIRMED)
+// so that schema stays additive when Phase 2 is built.
+enum BookingStatus {
+  CONFIRMED
+  WAITLISTED
+  RAC
+  PARTIALLY_CONFIRMED
+  CANCELLED
+}
+
+enum PassengerStatus {
+  CONFIRMED
+  WAITLISTED
+  RAC
+  CANCELLED
+}
+
+enum PaymentStatus {
+  PENDING
+  SUCCESS
+  FAILED
+  REFUNDED
+}
+
+enum Gender {
+  M
+  F
+  O
+}
+
+// ─── Tables ───────────────────────────────────────────────────────────────────
+
+model User {
+  id           String   @id @default(uuid())
+  name         String
+  email        String   @unique
+  passwordHash String   @map("password_hash")
+  role         Role     @default(USER)
+  createdAt    DateTime @default(now()) @map("created_at")
+
+  bookings Booking[]
+
+  @@map("users")
+}
+
+model Station {
+  id   String @id @default(uuid())
+  code String @unique
+  name String
+  city String
+
+  stops TrainStop[]
+
+  @@map("stations")
+}
+
+model Train {
+  id          String @id @default(uuid())
+  trainNumber String @unique @map("train_number")
+  name        String
+  // Weekday bitmask stored as array of ints (0=Sun … 6=Sat).
+  // A train runs on a given date if that date's weekday is in this array.
+  runDays     Int[]  @map("run_days")
+
+  stops    TrainStop[]
+  coaches  Coach[]
+  bookings Booking[]
+
+  @@map("trains")
+}
+
+model TrainStop {
+  id            String  @id @default(uuid())
+  trainId       String  @map("train_id")
+  stationId     String  @map("station_id")
+  stopOrder     Int     @map("stop_order")
+  // Stored as "HH:MM"; nullable at first and last stop respectively.
+  arrivalTime   String? @map("arrival_time")
+  departureTime String? @map("departure_time")
+  // 0 = same calendar day as departure, 1 = next day, etc.
+  dayOffset     Int     @default(0) @map("day_offset")
+  // Cumulative km from the train's origin stop — used for fare calculation.
+  distanceKm    Int     @map("distance_km")
+
+  train   Train   @relation(fields: [trainId], references: [id])
+  station Station @relation(fields: [stationId], references: [id])
+
+  bookingsFrom Booking[] @relation("BookingFromStop")
+  bookingsTo   Booking[] @relation("BookingToStop")
+
+  @@unique([trainId, stopOrder])
+  @@map("train_stops")
+}
+
+model Coach {
+  id          String    @id @default(uuid())
+  trainId     String    @map("train_id")
+  coachNumber String    @map("coach_number")
+  classType   ClassType @map("class_type")
+
+  train Train  @relation(fields: [trainId], references: [id])
+  seats Seat[]
+
+  @@unique([trainId, coachNumber])
+  @@map("coaches")
+}
+
+model Seat {
+  id         String    @id @default(uuid())
+  coachId    String    @map("coach_id")
+  seatNumber Int       @map("seat_number")
+  berthType  BerthType @map("berth_type")
+  // Phase-4 optimistic lock column — present from day 1, unused until Phase 4.
+  version    Int       @default(0)
+
+  coach Coach @relation(fields: [coachId], references: [id])
+
+  passengers BookingPassenger[]
+
+  @@map("seats")
+}
+
+model Booking {
+  id          String        @id @default(uuid())
+  pnr         String        @unique
+  userId      String        @map("user_id")
+  trainId     String        @map("train_id")
+  journeyDate DateTime      @map("journey_date") @db.Date
+  fromStopId  String        @map("from_stop_id")
+  toStopId    String        @map("to_stop_id")
+  status      BookingStatus
+  totalFare   Int           @map("total_fare")
+  createdAt   DateTime      @default(now()) @map("created_at")
+
+  user       User               @relation(fields: [userId], references: [id])
+  train      Train              @relation(fields: [trainId], references: [id])
+  fromStop   TrainStop          @relation("BookingFromStop", fields: [fromStopId], references: [id])
+  toStop     TrainStop          @relation("BookingToStop", fields: [toStopId], references: [id])
+  passengers BookingPassenger[]
+  payments   Payment[]
+
+  // Primary availability query: find active bookings for a train+date
+  @@index([trainId, journeyDate, status])
+  // Booking history: list a user's bookings newest first
+  @@index([userId, createdAt])
+  @@map("bookings")
+}
+
+model BookingPassenger {
+  id        String          @id @default(uuid())
+  bookingId String          @map("booking_id")
+  name      String
+  age       Int
+  gender    Gender
+  // Nullable: NULL means no seat assigned yet → Phase-2 waitlist mechanism.
+  seatId    String?         @map("seat_id")
+  status    PassengerStatus
+
+  booking Booking @relation(fields: [bookingId], references: [id])
+  seat    Seat?   @relation(fields: [seatId], references: [id])
+
+  @@map("booking_passengers")
+}
+
+model Payment {
+  id             String        @id @default(uuid())
+  bookingId      String        @map("booking_id")
+  amount         Int
+  status         PaymentStatus
+  // Phase-4 idempotent payments column — present from day 1, unused until Phase 4.
+  idempotencyKey String?       @unique @map("idempotency_key")
+  createdAt      DateTime      @default(now()) @map("created_at")
+
+  booking Booking @relation(fields: [bookingId], references: [id])
+
+  @@map("payments")
+}
