@@ -1,4 +1,4 @@
-import { PrismaClient, BerthType } from '@prisma/client';
+import { ClassType, PrismaClient, BerthType } from '@prisma/client';
 
 const prisma = new PrismaClient();
 
@@ -63,6 +63,20 @@ async function main() {
   const stations = await prisma.station.findMany();
   const sid = Object.fromEntries(stations.map((st) => [st.code, st.id]));
 
+  // ── Helper: upsert coach_class_config ─────────────────────────────────────
+  async function upsertClassConfig(
+    trainId: string,
+    classType: ClassType,
+    racCapacity: number,
+    maxWaitlist: number,
+  ) {
+    await prisma.coachClassConfig.upsert({
+      where: { trainId_classType: { trainId, classType } },
+      update: {},
+      create: { trainId, classType, racCapacity, maxWaitlist },
+    });
+  }
+
   // ── Helper: upsert a coach and create its seats ────────────────────────────
   async function upsertCoach(trainId: string, coachNumber: string, classType: string) {
     const coach = await prisma.coach.upsert({
@@ -106,6 +120,11 @@ async function main() {
   ]) {
     await upsertCoach(telangana.id, coachNumber, classType);
   }
+  // 4 SL coaches: 9 SIDE_LOWERs each → 8 dedicated to RAC = 16 slots; 200 WL cap
+  await upsertClassConfig(telangana.id, ClassType.SL,      16,  200);
+  await upsertClassConfig(telangana.id, ClassType.THREE_A,  6,  100);
+  await upsertClassConfig(telangana.id, ClassType.TWO_A,    4,   50);
+  await upsertClassConfig(telangana.id, ClassType.FIRST_A,  2,   20);
   console.log('  ✓ 12723 Telangana Express');
 
   // ── Train 2: 12621 Tamil Nadu Express (MAS → NDLS, daily) ─────────────────
@@ -134,6 +153,10 @@ async function main() {
   ]) {
     await upsertCoach(tamilNadu.id, coachNumber, classType);
   }
+  await upsertClassConfig(tamilNadu.id, ClassType.SL,      16,  200);
+  await upsertClassConfig(tamilNadu.id, ClassType.THREE_A,  6,  100);
+  await upsertClassConfig(tamilNadu.id, ClassType.TWO_A,    4,   50);
+  await upsertClassConfig(tamilNadu.id, ClassType.FIRST_A,  2,   20);
   console.log('  ✓ 12621 Tamil Nadu Express');
 
   // ── Train 3: 12951 Mumbai Rajdhani (CSTM → NDLS, Mon/Wed/Thu/Fri) ─────────
@@ -162,6 +185,9 @@ async function main() {
   ]) {
     await upsertCoach(rajdhani.id, coachNumber, classType);
   }
+  await upsertClassConfig(rajdhani.id, ClassType.THREE_A,  6,  100);
+  await upsertClassConfig(rajdhani.id, ClassType.TWO_A,    8,   50);
+  await upsertClassConfig(rajdhani.id, ClassType.FIRST_A,  4,   20);
   console.log('  ✓ 12951 Mumbai Rajdhani');
 
   console.log('Seed complete.');

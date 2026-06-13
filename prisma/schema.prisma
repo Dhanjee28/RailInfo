@@ -96,9 +96,10 @@ model Train {
   // A train runs on a given date if that date's weekday is in this array.
   runDays     Int[]  @map("run_days")
 
-  stops    TrainStop[]
-  coaches  Coach[]
-  bookings Booking[]
+  stops       TrainStop[]
+  coaches     Coach[]
+  bookings    Booking[]
+  classConfigs CoachClassConfig[]
 
   @@map("trains")
 }
@@ -181,14 +182,17 @@ model Booking {
 }
 
 model BookingPassenger {
-  id        String          @id @default(uuid())
-  bookingId String          @map("booking_id")
-  name      String
-  age       Int
-  gender    Gender
+  id               String          @id @default(uuid())
+  bookingId        String          @map("booking_id")
+  name             String
+  age              Int
+  gender           Gender
   // Nullable: NULL means no seat assigned yet → Phase-2 waitlist mechanism.
-  seatId    String?         @map("seat_id")
-  status    PassengerStatus
+  seatId           String?         @map("seat_id")
+  status           PassengerStatus
+  // Phase-2 queue positions — exactly one is non-null when status = WAITLISTED / RAC
+  waitlistPosition Int?            @map("waitlist_position")
+  racPosition      Int?            @map("rac_position")
 
   booking Booking @relation(fields: [bookingId], references: [id])
   seat    Seat?   @relation(fields: [seatId], references: [id])
@@ -208,4 +212,22 @@ model Payment {
   booking Booking @relation(fields: [bookingId], references: [id])
 
   @@map("payments")
+}
+
+// One row per (train, class_type). Defines the RAC and waitlist quotas for each
+// class on each train — the allocation algorithm reads these before accepting bookings.
+model CoachClassConfig {
+  id           String    @id @default(uuid())
+  trainId      String    @map("train_id")
+  classType    ClassType @map("class_type")
+  // Total RAC passenger slots (2 passengers share one side-lower berth, so
+  // rac_capacity = side-lower-berths-designated-for-RAC × 2)
+  racCapacity  Int       @map("rac_capacity")
+  // Maximum waitlist positions allowed; booking refused beyond this
+  maxWaitlist  Int       @map("max_waitlist")
+
+  train Train @relation(fields: [trainId], references: [id])
+
+  @@unique([trainId, classType])
+  @@map("coach_class_configs")
 }
