@@ -53,6 +53,36 @@ export const bookingRepository = {
     });
   },
 
+  // Public PNR lookup — includes Phase 2 queue positions.
+  // Omits payment details (not shown on public status page).
+  findByPnrPublic(pnr: string) {
+    return prisma.booking.findUnique({
+      where: { pnr },
+      include: {
+        train:    { select: { trainNumber: true, name: true } },
+        fromStop: { include: { station: { select: { code: true, name: true } } } },
+        toStop:   { include: { station: { select: { code: true, name: true } } } },
+        passengers: {
+          select: {
+            name:             true,
+            age:              true,
+            gender:           true,
+            status:           true,
+            waitlistPosition: true,
+            racPosition:      true,
+            seat: {
+              select: {
+                seatNumber: true,
+                berthType:  true,
+                coach: { select: { coachNumber: true } },
+              },
+            },
+          },
+        },
+      },
+    });
+  },
+
   // Returns up to `count` seats of `classType` on `trainId` that have no active booking
   // on `journeyDate`. This is the Phase-1 check-then-act pattern — intentionally not
   // wrapped in a lock. Phase 4 fixes the race condition via SELECT FOR UPDATE.
