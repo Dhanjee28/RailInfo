@@ -190,6 +190,9 @@ model BookingPassenger {
   // Nullable: NULL means no seat assigned yet → Phase-2 waitlist mechanism.
   seatId           String?         @map("seat_id")
   status           PassengerStatus
+  // Needed to scope WL/RAC queries to the right class — WL passengers have
+  // null seatId, so class can't be inferred from the seat relationship.
+  classType        ClassType?      @map("class_type")
   // Phase-2 queue positions — exactly one is non-null when status = WAITLISTED / RAC
   waitlistPosition Int?            @map("waitlist_position")
   racPosition      Int?            @map("rac_position")
