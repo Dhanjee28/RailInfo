@@ -2,7 +2,7 @@ import { Request, Response, NextFunction } from 'express';
 import jwt from 'jsonwebtoken';
 import { Role } from '@prisma/client';
 import { env } from '../config/env';
-import { UnauthorizedError } from '../errors/AppError';
+import { ForbiddenError, UnauthorizedError } from '../errors/AppError';
 
 interface JwtPayload {
   userId: string;
@@ -30,4 +30,23 @@ export function requireAuth(req: Request, _res: Response, next: NextFunction): v
     // Covers TokenExpiredError, JsonWebTokenError, NotBeforeError
     next(new UnauthorizedError('Token is invalid or expired'));
   }
+}
+
+// Gate a route to a specific role. Must be stacked AFTER requireAuth so req.user
+// is populated. Trusts the signed JWT's role claim — the token is tamper-proof,
+// so no DB round-trip is needed for the common case. (If immediate role-revocation
+// mattered, you'd re-verify from the DB here; the 15-min access-token window is
+// the accepted tradeoff, same as we made for token revocation.)
+export function requireRole(role: Role) {
+  return (req: Request, _res: Response, next: NextFunction): void => {
+    if (!req.user) {
+      next(new UnauthorizedError('Authentication required'));
+      return;
+    }
+    if (req.user.role !== role) {
+      next(new ForbiddenError(`Requires ${role} role`));
+      return;
+    }
+    next();
+  };
 }

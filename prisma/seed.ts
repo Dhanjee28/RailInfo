@@ -1,45 +1,26 @@
-import { ClassType, PrismaClient, BerthType } from '@prisma/client';
+import { ClassType, PrismaClient, Role } from '@prisma/client';
+import bcrypt from 'bcrypt';
+import { seatRows } from '../src/domain/seatLayout';
 
 const prisma = new PrismaClient();
-
-// ─── Seat layout helpers ───────────────────────────────────────────────────────
-// Prisma enum names use the Prisma-side name (THREE_A, not "3A").
-// @map("3A") only affects the PostgreSQL enum value stored in the DB.
-
-const BERTH_PATTERN: Record<string, BerthType[]> = {
-  SL: [
-    BerthType.LOWER, BerthType.MIDDLE, BerthType.UPPER,
-    BerthType.LOWER, BerthType.MIDDLE, BerthType.UPPER,
-    BerthType.SIDE_LOWER, BerthType.SIDE_UPPER,
-  ],
-  THREE_A: [
-    BerthType.LOWER, BerthType.MIDDLE, BerthType.UPPER,
-    BerthType.LOWER, BerthType.MIDDLE, BerthType.UPPER,
-    BerthType.SIDE_LOWER, BerthType.SIDE_UPPER,
-  ],
-  TWO_A: [BerthType.LOWER, BerthType.UPPER, BerthType.SIDE_LOWER, BerthType.SIDE_UPPER],
-  FIRST_A: [BerthType.LOWER, BerthType.UPPER],
-};
-
-const SEAT_COUNT: Record<string, number> = {
-  SL: 72, THREE_A: 64, TWO_A: 46, FIRST_A: 18,
-};
-
-function seatRows(coachId: string, classType: string) {
-  const count = SEAT_COUNT[classType];
-  const pattern = BERTH_PATTERN[classType];
-  return Array.from({ length: count }, (_, i) => ({
-    coachId,
-    seatNumber: i + 1,
-    berthType: pattern[i % pattern.length],
-    version: 0,
-  }));
-}
 
 // ─── Main seed ────────────────────────────────────────────────────────────────
 
 async function main() {
   console.log('Seeding database…');
+
+  // ── Admin user (Phase 3 RBAC) — password: admin12345 ──────────────────────
+  await prisma.user.upsert({
+    where:  { email: 'admin@railinfor.test' },
+    update: {},
+    create: {
+      name:         'Platform Admin',
+      email:        'admin@railinfor.test',
+      passwordHash: await bcrypt.hash('admin12345', 10),
+      role:         Role.ADMIN,
+    },
+  });
+  console.log('  ✓ admin user (admin@railinfor.test / admin12345)');
 
   // ── Stations ──────────────────────────────────────────────────────────────
   const stationData = [
