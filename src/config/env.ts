@@ -10,6 +10,8 @@ const envSchema = z.object({
   JWT_SECRET: z.string().min(32),
   JWT_EXPIRES_IN: z.string().default('15m'),
   BCRYPT_ROUNDS: z.coerce.number().int().min(10).default(10),
+  // Refresh token lifetime in days; the access token stays short (JWT_EXPIRES_IN).
+  REFRESH_TOKEN_TTL_DAYS: z.coerce.number().int().positive().default(7),
 });
 
 const parsed = envSchema.safeParse(process.env);

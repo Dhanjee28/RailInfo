@@ -72,9 +72,29 @@ model User {
   role         Role     @default(USER)
   createdAt    DateTime @default(now()) @map("created_at")
 
-  bookings Booking[]
+  bookings      Booking[]
+  refreshTokens RefreshToken[]
 
   @@map("users")
+}
+
+// Phase-3 refresh token store. The raw token never touches the DB — only its
+// SHA-256 hash. familyId groups all tokens descended from one login so that
+// detecting reuse of a rotated token lets us revoke the whole family (theft).
+model RefreshToken {
+  id        String    @id @default(uuid())
+  userId    String    @map("user_id")
+  tokenHash String    @unique @map("token_hash")
+  familyId  String    @map("family_id")
+  expiresAt DateTime  @map("expires_at")
+  revokedAt DateTime? @map("revoked_at")
+  createdAt DateTime  @default(now()) @map("created_at")
+
+  user User @relation(fields: [userId], references: [id])
+
+  @@index([userId])
+  @@index([familyId])
+  @@map("refresh_tokens")
 }
 
 model Station {
