@@ -7,6 +7,7 @@ import trainRouter   from './routes/train.routes';
 import bookingRouter from './routes/booking.routes';
 import pnrRouter     from './routes/pnr.routes';
 import adminRouter   from './routes/admin.routes';
+import stationRouter from './routes/station.routes';
 
 const app = express();
 
@@ -23,6 +24,7 @@ app.use('/api/v1/trains',   trainRouter);
 app.use('/api/v1/bookings', bookingRouter);
 app.use('/api/v1/pnr',      pnrRouter);
 app.use('/api/v1/admin',    adminRouter);
+app.use('/api/v1/stations', stationRouter);
 
 app.use(errorHandler);
 

@@ -12,6 +12,7 @@ const envSchema = z.object({
   BCRYPT_ROUNDS: z.coerce.number().int().min(10).default(10),
   // Refresh token lifetime in days; the access token stays short (JWT_EXPIRES_IN).
   REFRESH_TOKEN_TTL_DAYS: z.coerce.number().int().positive().default(7),
+  REDIS_URL: z.string().url().default('redis://localhost:6379'),
 });
 
 const parsed = envSchema.safeParse(process.env);

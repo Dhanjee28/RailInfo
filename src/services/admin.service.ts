@@ -1,6 +1,8 @@
 import { ClassType } from '@prisma/client';
 import { z } from 'zod';
 import { adminRepository } from '../repositories/admin.repository';
+import { cacheDel } from '../utils/cache';
+import { STATIONS_CACHE_KEY } from './station.service';
 import { BadRequestError, ConflictError, NotFoundError } from '../errors/AppError';
 import {
   createStationSchema,
@@ -23,7 +25,9 @@ export const adminService = {
   async createStation(data: CreateStationInput) {
     const existing = await adminRepository.findStationByCode(data.code);
     if (existing) throw new ConflictError('STATION_EXISTS', `Station ${data.code} already exists`);
-    return adminRepository.createStation(data);
+    const station = await adminRepository.createStation(data);
+    await cacheDel(STATIONS_CACHE_KEY); // station list is now stale
+    return station;
   },
 
   async createTrain(data: CreateTrainInput) {
@@ -62,7 +66,9 @@ export const adminService = {
   async updateTrain(trainNumber: string, data: UpdateTrainInput) {
     const existing = await adminRepository.findTrainByNumber(trainNumber);
     if (!existing) throw new NotFoundError(`Train ${trainNumber}`);
-    return adminRepository.updateTrain(trainNumber, data);
+    const train = await adminRepository.updateTrain(trainNumber, data);
+    await cacheDel(`train:${trainNumber}`); // cached static detail is now stale
+    return train;
   },
 
   async createCoach(data: CreateCoachInput) {

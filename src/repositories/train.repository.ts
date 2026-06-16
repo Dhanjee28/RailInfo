@@ -23,6 +23,32 @@ export const trainRepository = {
     });
   },
 
+  // Static train detail only (route + timings), no availability. Cacheable —
+  // this data changes only on admin edits, not on every booking. Includes the
+  // internal id so the service can compute live availability without a re-query.
+  findStaticByNumber(trainNumber: string) {
+    return prisma.train.findUnique({
+      where:  { trainNumber },
+      select: {
+        id:          true,
+        trainNumber: true,
+        name:        true,
+        runDays:     true,
+        stops: {
+          orderBy: { stopOrder: 'asc' },
+          select: {
+            stopOrder:     true,
+            arrivalTime:   true,
+            departureTime: true,
+            dayOffset:     true,
+            distanceKm:    true,
+            station: { select: { code: true, name: true, city: true } },
+          },
+        },
+      },
+    });
+  },
+
   findByTrainNumber(trainNumber: string) {
     return prisma.train.findUnique({
       where: { trainNumber },

@@ -1,6 +1,28 @@
 import { ClassType } from '@prisma/client';
 import { trainRepository, AvailabilityMap } from '../repositories/train.repository';
+import { cacheAside } from '../utils/cache';
 import { NotFoundError, BadRequestError } from '../errors/AppError';
+
+// Cache TTLs (seconds). Search is short — availability changes constantly, so a
+// 60s window is the honest staleness. Detail's STATIC part lives an hour.
+const SEARCH_TTL = 60;
+const DETAIL_TTL = 60 * 60;
+
+type StaticTrainStop = {
+  stopOrder:     number;
+  station:       { code: string; name: string; city: string };
+  arrivalTime:   string | null;
+  departureTime: string | null;
+  dayOffset:     number;
+  distanceKm:    number;
+};
+type StaticTrain = {
+  id:          string;
+  trainNumber: string;
+  name:        string;
+  runDays:     number[];
+  stops:       StaticTrainStop[];
+};
 
 // Maps Prisma ClassType enum names to the human-readable labels clients expect.
 const CLASS_LABEL: Record<ClassType, string> = {
@@ -25,7 +47,15 @@ function labelledAvailability(raw: AvailabilityMap) {
 }
 
 export const trainService = {
-  async search(sourceCode: string, destCode: string, dateStr: string) {
+  search(sourceCode: string, destCode: string, dateStr: string) {
+    // Cache-aside: whole result for 60s. Availability is embedded but the short
+    // TTL keeps it honest — search is a broad listing, not the booking path.
+    return cacheAside(`search:${sourceCode}:${destCode}:${dateStr}`, SEARCH_TTL, () =>
+      this.runSearch(sourceCode, destCode, dateStr),
+    );
+  },
+
+  async runSearch(sourceCode: string, destCode: string, dateStr: string) {
     const journeyDate = parseDate(dateStr);
     const weekday = journeyDate.getUTCDay(); // 0 = Sun … 6 = Sat
 
@@ -69,10 +99,7 @@ export const trainService = {
   },
 
   async getDetails(trainNumber: string, dateStr?: string) {
-    const train = await trainRepository.findByTrainNumber(trainNumber);
-    if (!train) throw new NotFoundError(`Train ${trainNumber}`);
-
-    // Validate date if provided — guard against a non-existent date like 2026-02-30
+    // Validate date BEFORE touching the cache — guard against e.g. 2026-02-30
     if (dateStr) {
       const [y, m, d] = dateStr.split('-').map(Number);
       const parsed = new Date(Date.UTC(y, m - 1, d));
@@ -81,28 +108,24 @@ export const trainService = {
       }
     }
 
-    const stops = train.stops.map((s) => ({
-      stopOrder:     s.stopOrder,
-      station:       { code: s.station.code, name: s.station.name, city: s.station.city },
-      arrivalTime:   s.arrivalTime,
-      departureTime: s.departureTime,
-      dayOffset:     s.dayOffset,
-      distanceKm:    s.distanceKm,
-    }));
+    // Static route detail is cached (1h, invalidated on admin train edits).
+    // Availability is NEVER cached — it's recomputed live below for the date.
+    const cached = await cacheAside<StaticTrain | null>(`train:${trainNumber}`, DETAIL_TTL, async () => {
+      const t = await trainRepository.findStaticByNumber(trainNumber);
+      return t as StaticTrain | null;
+    });
+    if (!cached) throw new NotFoundError(`Train ${trainNumber}`);
 
     let availability: Record<string, { total: number; available: number }> | undefined;
     if (dateStr) {
-      const journeyDate = parseDate(dateStr);
-      const raw = await trainRepository.getAvailability(train.id, journeyDate);
+      const raw = await trainRepository.getAvailability(cached.id, parseDate(dateStr));
       availability = labelledAvailability(raw);
     }
 
+    const { id: _internalId, ...pub } = cached;
     return {
       train: {
-        trainNumber: train.trainNumber,
-        name:        train.name,
-        runDays:     train.runDays,
-        stops,
+        ...pub,
         ...(availability && { availability }),
       },
     };
