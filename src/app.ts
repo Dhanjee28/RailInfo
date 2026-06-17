@@ -1,8 +1,11 @@
 
 import express from 'express';
 import cookieParser from 'cookie-parser';
+import swaggerUi from 'swagger-ui-express';
 import { errorHandler } from './middlewares/errorHandler';
+import { requestLogger } from './middlewares/requestLogger';
 import { globalLimiter } from './middlewares/rateLimit';
+import { buildOpenApiDocument } from './docs/openapi';
 import authRouter    from './routes/auth.routes';
 import trainRouter   from './routes/train.routes';
 import bookingRouter from './routes/booking.routes';
@@ -11,6 +14,10 @@ import adminRouter   from './routes/admin.routes';
 import stationRouter from './routes/station.routes';
 
 const app = express();
+
+// First: assign a requestId + log each request's completion. Everything
+// downstream (including the limiter) logs correlated to this request.
+app.use(requestLogger);
 
 app.use(express.json());
 app.use(cookieParser());
@@ -23,6 +30,11 @@ app.use(globalLimiter);
 app.get('/health', (_req, res) => {
   res.json({ success: true, data: { status: 'ok' } });
 });
+
+// API docs — OpenAPI generated from the Zod validators (single source of truth).
+const openApiDocument = buildOpenApiDocument();
+app.get('/api/docs.json', (_req, res) => res.json(openApiDocument));
+app.use('/api/docs', swaggerUi.serve, swaggerUi.setup(openApiDocument));
 
 app.use('/api/v1/auth',     authRouter);
 app.use('/api/v1/trains',   trainRouter);
