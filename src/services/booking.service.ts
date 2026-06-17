@@ -7,6 +7,7 @@ import { bookingRepository } from '../repositories/booking.repository';
 import { trainRepository } from '../repositories/train.repository';
 import { allocationService } from './allocation.service';
 import { promotionService } from './promotion.service';
+import { logger } from '../utils/logger';
 import { ForbiddenError, NotFoundError, ConflictError, BadRequestError } from '../errors/AppError';
 import { createBookingSchema } from '../validators/booking.validators';
 
@@ -153,6 +154,13 @@ export const bookingService = {
 
     if (!booking) throw new ConflictError('PNR_GENERATION_FAILED', 'Could not generate a unique PNR — please retry');
 
+    logger.info('booking created', {
+      pnr:        booking.pnr,
+      status:     booking.status,
+      trainId:    train.id,
+      passengers: booking.passengers.length,
+    });
+
     return {
       pnr:        booking.pnr,
       status:     booking.status,
@@ -205,6 +213,12 @@ export const bookingService = {
           tx,
         );
       }
+    });
+
+    logger.info('booking cancelled', {
+      pnr:           booking.pnr,
+      passengers:    toPromote.length,
+      trainId:       booking.trainId,
     });
 
     return { pnr: booking.pnr, status: BookingStatus.CANCELLED };

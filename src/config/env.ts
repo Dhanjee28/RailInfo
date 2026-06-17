@@ -13,6 +13,8 @@ const envSchema = z.object({
   // Refresh token lifetime in days; the access token stays short (JWT_EXPIRES_IN).
   REFRESH_TOKEN_TTL_DAYS: z.coerce.number().int().positive().default(7),
   REDIS_URL: z.string().url().default('redis://localhost:6379'),
+  // Overrides the default level (info in prod, debug otherwise). e.g. 'warn', 'silent'.
+  LOG_LEVEL: z.enum(['fatal', 'error', 'warn', 'info', 'debug', 'trace', 'silent']).optional(),
 });
 
 const parsed = envSchema.safeParse(process.env);

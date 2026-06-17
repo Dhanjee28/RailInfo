@@ -5,6 +5,7 @@
 // You also need to explain why this runs *inside* the cancel transaction.
 import { BerthType, ClassType, PassengerStatus, Prisma } from '@prisma/client';
 import { PassengerStateMachine } from './passengerStateMachine';
+import { logger } from '../utils/logger';
 
 // The transaction client type Prisma passes into $transaction callbacks.
 type Tx = Omit<Prisma.TransactionClient, '$connect' | '$disconnect' | '$on' | '$transaction' | '$use' | '$extends'>;
@@ -49,6 +50,7 @@ export const promotionService = {
           where: { id: topRac.id },
           data:  { status: PassengerStatus.CONFIRMED, seatId: freedSeatId, racPosition: null },
         });
+        logger.info('passenger promoted', { passengerId: topRac.id, from: 'RAC', to: 'CONFIRMED', classType });
 
         // Renumber remaining RAC positions (fill the gap left by topRac).
         await tx.bookingPassenger.updateMany({
@@ -147,6 +149,7 @@ async function promoteTopWlToRac(
       waitlistPosition: null,
     },
   });
+  logger.info('passenger promoted', { passengerId: topWl.id, from: 'WAITLISTED', to: 'RAC', classType });
 
   // Close the gap in waitlist positions left by topWl.
   await tx.bookingPassenger.updateMany({
