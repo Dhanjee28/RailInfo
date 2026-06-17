@@ -11,6 +11,11 @@ services:
       - '5432:5432'
     volumes:
       - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U postgres -d irctc_clone']
+      interval: 5s
+      timeout: 5s
+      retries: 10
 
   redis:
     image: redis:7-alpine
@@ -20,6 +25,57 @@ services:
       - '6379:6379'
     volumes:
       - redis_data:/data
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # One-shot job: apply migrations + seed, then exit. Built from the `builder`
+  # stage because it needs the Prisma CLI and ts-node (the slim app image has
+  # neither). The app waits for this to complete successfully.
+  migrate:
+    build:
+      context: .
+      target: builder
+    command: sh -c "npx prisma migrate deploy && npx ts-node prisma/seed.ts"
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/irctc_clone
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  app:
+    build:
+      context: .
+      target: runtime
+    container_name: irctc_app
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/irctc_clone
+      REDIS_URL: redis://redis:6379
+      # Demo secret — override for any real deployment.
+      JWT_SECRET: docker_compose_dev_secret_change_me_min_32_chars
+      JWT_EXPIRES_IN: 15m
+      BCRYPT_ROUNDS: '10'
+      REFRESH_TOKEN_TTL_DAYS: '7'
+    ports:
+      - '3000:3000'
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ['CMD', 'wget', '-qO-', 'http://localhost:3000/health']
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
 
 volumes:
   postgres_data:
