@@ -226,3 +226,68 @@ Freeing confirmed seats first triggers the longest promotion chains, so they're 
 
 **A non-idempotent seed had duplicated every physical seat**
 The seed used `createMany({ skipDuplicates: true })`, but `skipDuplicates` only skips rows that violate a **unique constraint** — and `seats` had none on `(coach_id, seat_number)`. So each re-run inserted a fresh set of seats with new UUIDs, silently doubling inventory. Allocation then handed out two distinct rows that were really the same physical seat. Adding `@@unique([coachId, seatNumber])` makes the seed genuinely idempotent and prevents recurrence. Lesson worth stating in interviews: *`skipDuplicates` is a no-op without a constraint to act on — idempotency must be enforced by the schema, not assumed by the loader.*
+
+## Architecture Decisions — Phase 3
+
+Phase 3 adds no new business logic — it makes the backend operate like something a company runs: hardened auth, RBAC, caching, rate limiting, structured logging, containerization, and API docs.
+
+### Step (a) — Refresh tokens (rotation + reuse detection)
+
+**Access token short, refresh token long — two different jobs**
+The access token stays a 15-min JWT (stateless, carries `{userId, role}`). A new opaque 256-bit refresh token (7-day) is issued at login in an httpOnly, `SameSite=strict`, path-scoped (`/api/v1/auth`) cookie. The split is the standard tradeoff: short access tokens limit the blast radius of a leak without forcing the user to log in constantly, because the refresh token silently mints new ones.
+
+**Why SHA-256 the refresh token, not bcrypt**
+Only the token's SHA-256 hash is stored, so a DB leak exposes no usable tokens. SHA-256 (fast) is correct here precisely because the token is already 256 bits of entropy — bcrypt's deliberate slowness only buys security for *low-entropy* secrets like human passwords. Using bcrypt here would be cargo-culting.
+
+**Rotation + reuse detection = theft response**
+Every refresh revokes the presented token and issues a new one in the same `family_id`. A correctly-behaving client never presents a rotated token twice — so if an already-revoked token is presented, that's a theft signal: the whole family is revoked (forcing re-login). This turns token rotation from a nicety into an active intrusion-detection mechanism.
+
+**No access-token blacklist**
+Logout revokes the refresh token; the access token simply expires within 15 min. A per-request blacklist would re-introduce the statefulness JWTs exist to avoid. Naming the 15-min window as the accepted cost — rather than over-engineering a blacklist — is the senior answer.
+
+### Step (b) — RBAC
+
+**`requireRole('ADMIN')` trusts the signed JWT claim**
+The role lives in the JWT; the middleware checks `req.user.role` with no DB round-trip, because the token is tamper-proof (HS256-signed). A DB re-verification would only matter if immediate role-revocation were required — the same 15-min staleness tradeoff as the access token, documented in the middleware. Stacked *after* `requireAuth` and applied once at the router level, so every admin route is fail-closed.
+
+**Seat generation extracted to one source of truth**
+`src/domain/seatLayout.ts` holds the berth pattern; both the seed and `POST /admin/coaches` use it, so a manually-added coach is laid out identically to a seeded one.
+
+### Step (c) — Redis cache-aside
+
+**There is no universal caching strategy — choose per key**
+- **TTL-only** (`search:{src}:{dst}:{date}`, 60s): a broad listing where bounded staleness is acceptable.
+- **TTL + explicit invalidation** (`train:{number}` 1h, `stations:all` 24h): rarely changes, must be correct right after an admin edit — so the admin write `DEL`s the key.
+- **Refuse to cache** (seat availability, PNR status): correctness in the money path beats speed; stale availability means failed bookings. Train *detail* caches only the **static route** — availability is recomputed live on every request and never stored.
+
+**Caching is an optimisation, never a correctness dependency**
+The Redis client uses `enableOfflineQueue: false` + bounded retry, and every cache call is wrapped so a Redis outage falls straight through to the database. The cache also never stores `null`, so a one-off miss can't poison a key with a negative entry that outlives a later create.
+
+### Step (d) — Rate limiting
+
+**Sliding-window counter, in Redis, evaluated atomically**
+Two fixed sub-windows (current + previous) with the trailing count estimated as `current + previous × (fraction of window remaining)`. This approximates a true sliding window at a fraction of the cost of a sliding *log* (which stores every request timestamp) — be ready to compare fixed-window, sliding-log, sliding-counter, and token-bucket. The check + increment run in one Lua script so they're atomic.
+
+**Redis-backed, not in-memory — and it fails open**
+In-memory counters reset per instance: with N app instances an attacker gets N× the limit. A shared Redis store enforces one global limit. But if Redis is unreachable the limiter *allows* the request (fails open) — a rate limiter must never take down the API. Tiers: global 100/min/IP, login 5/min/IP (credential stuffing), register 3/hour/IP (spam), bookings 10/min/user. Blocks return 429 + `Retry-After`.
+
+### Step (e) — Structured logging + request correlation
+
+**`requestId` via AsyncLocalStorage — correlation with zero plumbing**
+A middleware seeds a per-request UUID into an `AsyncLocalStorage` store and echoes it as the `X-Request-Id` header. The pino logger's `mixin` reads that store on every line, so *all* logs emitted while handling a request — across services, repositories, anywhere — carry the same `requestId`, without threading it through a single function signature. Correlation is the thing that makes production debugging possible.
+
+**Redact at the logger, silent in tests**
+A `redact` list strips passwords/tokens/authorization headers from any log payload. The logger is `silent` under `NODE_ENV=test` so unit-test output stays clean and no log handle leaks. State changes (`booking created`, `booking cancelled`, `passenger promoted`) are logged for an audit trail.
+
+### Step (f) — Docker
+
+**Multi-stage build, slim non-root runtime**
+The `builder` stage carries the full toolchain (compiles TS, generates the Prisma client); the `runtime` stage is `node:20-alpine` with production deps only, the compiled `dist`, the generated Prisma client, and a non-root `nodejs` user — ~127 MB. `apk add openssl` in both stages because Prisma's engine needs it on alpine.
+
+**A one-shot migration job, not migrations-in-the-app**
+A dedicated `migrate` compose service (built from the `builder` stage, so it has the Prisma CLI + ts-node) runs `migrate deploy` + seed then exits; the `app` waits on `condition: service_completed_successfully`. This keeps the runtime image free of dev tooling while still giving a one-command, seeded demo. Healthchecks (`pg_isready`, `redis-cli ping`, `wget /health`) gate startup order via `depends_on: condition: service_healthy`.
+
+### Step (g) — OpenAPI / Swagger from Zod
+
+**Docs generated from the validators — they can't drift**
+`@asteasolutions/zod-to-openapi` builds the OpenAPI 3.0 spec from the *same* Zod schemas `validate()` enforces, served via Swagger UI at `/api/docs`. The `classType` enum, `passengers` max of 6, and password min-length appear in the docs automatically because they *are* the validation rules — there's no second hand-maintained description to fall out of sync.
