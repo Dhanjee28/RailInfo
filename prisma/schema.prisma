@@ -219,10 +219,18 @@ model BookingPassenger {
   // Phase-2 queue positions — exactly one is non-null when status = WAITLISTED / RAC
   waitlistPosition Int?            @map("waitlist_position")
   racPosition      Int?            @map("rac_position")
+  // [P4] Denormalized from the booking so the safety-net unique index can live on
+  // this single table. A seat is reusable across dates, so the index key needs it.
+  journeyDate      DateTime        @map("journey_date") @db.Date
 
   booking Booking @relation(fields: [bookingId], references: [id])
   seat    Seat?   @relation(fields: [seatId], references: [id])
 
+  // The partial UNIQUE index `(seat_id, journey_date) WHERE status='CONFIRMED'`
+  // is created via raw SQL in the migration (Prisma can't express partial indexes).
+  // It makes a confirmed double-booking IMPOSSIBLE at the DB level — the last line
+  // of defence behind the app locks. RAC is intentionally excluded (a side-lower
+  // berth is shared by 2 RAC passengers; that 2-cap stays enforced in app logic).
   @@map("booking_passengers")
 }
 

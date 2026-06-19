@@ -5,9 +5,10 @@ import { PrismaClientKnownRequestError } from '@prisma/client/runtime/library';
 import { z } from 'zod';
 import { bookingRepository } from '../repositories/booking.repository';
 import { trainRepository } from '../repositories/train.repository';
-import { allocationService } from './allocation.service';
 import { promotionService } from './promotion.service';
 import { logger } from '../utils/logger';
+import { env } from '../config/env';
+import { withRedisLock } from '../utils/redisLock';
 import { ForbiddenError, NotFoundError, ConflictError, BadRequestError } from '../errors/AppError';
 import { createBookingSchema } from '../validators/booking.validators';
 
@@ -113,26 +114,35 @@ export const bookingService = {
     const classType      = API_CLASS_TO_PRISMA[data.classType];
     const passengerCount = data.passengers.length;
 
-    // 4–5. Allocate each passenger to CONFIRMED / RAC / WAITLISTED.
-    // allocationService owns the fill order + berth preference + WL cap; it throws
-    // WAITLIST_FULL (409) if the booking can't fit. The check-then-act race lives
-    // inside it now (free seats are read, then written in a separate tx) — Phase 4.
-    const { bookingStatus, allocations } = await allocationService.allocate(
-      train.id,
-      journeyDate,
-      classType,
-      data.passengers.map((p) => ({ name: p.name, age: p.age, gender: p.gender as Gender })),
-    );
-
-    // 6. Fare calculation — every passenger pays; WL/RAC are refunded on cancel.
+    // 4. Fare calculation — every passenger pays; WL/RAC are refunded on cancel.
     const distanceKm = toStop.distanceKm - fromStop.distanceKm;
     const totalFare  = distanceKm * FARE_RATE[classType] * passengerCount;
 
-    // 7–8. Generate PNR, retry on the astronomically rare unique collision
+    const passengers = data.passengers.map((p) => ({ name: p.name, age: p.age, gender: p.gender as Gender }));
+
+    // 5–8. Allocate + write atomically using the configured concurrency strategy
+    // (Phase 4). Allocation (CNF/RAC/WL fill, WL cap → WAITLIST_FULL 409) runs
+    // inside the repo method's transaction so a concurrent booking can't interleave
+    // the read and write. PNR retry handles the astronomically rare collision.
+    const runCreate = (args: Parameters<typeof bookingRepository.createBookingWithLock>[0]) => {
+      switch (env.LOCK_STRATEGY) {
+        case 'optimistic':
+          return bookingRepository.createBookingOptimistic(args);
+        case 'redis': {
+          // Coarse lock over the whole train+date+class; the write needs no DB lock.
+          const date = args.journeyDate.toISOString().slice(0, 10);
+          const key  = `lock:booking:${args.trainId}:${date}:${args.classType}`;
+          return withRedisLock(key, 5000, () => bookingRepository.createBookingNoSeatLock(args));
+        }
+        default:
+          return bookingRepository.createBookingWithLock(args);
+      }
+    };
+
     let booking;
     for (let attempt = 0; attempt < 5; attempt++) {
       try {
-        booking = await bookingRepository.createBookingTx({
+        booking = await runCreate({
           pnr:         generatePnr(),
           userId,
           trainId:     train.id,
@@ -140,9 +150,8 @@ export const bookingService = {
           fromStopId:  fromStop.id,
           toStopId:    toStop.id,
           totalFare,
-          bookingStatus,
           classType,
-          passengers:  allocations,
+          passengers,
         });
         break;
       } catch (err) {
