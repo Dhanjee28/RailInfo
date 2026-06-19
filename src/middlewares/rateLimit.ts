@@ -1,5 +1,6 @@
 import { Request, Response, NextFunction } from 'express';
 import { redis } from '../config/redis';
+import { env } from '../config/env';
 import { logger } from '../utils/logger';
 import { TooManyRequestsError } from '../errors/AppError';
 
@@ -42,6 +43,10 @@ export const byIp   = (req: Request) => req.ip ?? 'unknown';
 export const byUser = (req: Request) => req.user?.userId ?? req.ip ?? 'unknown';
 
 export function rateLimit(opts: RateLimitOptions) {
+  // Globally disabled (e.g. load testing) → no-op middleware.
+  if (!env.RATE_LIMIT_ENABLED) {
+    return (_req: Request, _res: Response, next: NextFunction): void => next();
+  }
   return (req: Request, res: Response, next: NextFunction): void => {
     void (async () => {
       const id          = opts.key(req);

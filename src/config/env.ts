@@ -15,6 +15,12 @@ const envSchema = z.object({
   REDIS_URL: z.string().url().default('redis://localhost:6379'),
   // Overrides the default level (info in prod, debug otherwise). e.g. 'warn', 'silent'.
   LOG_LEVEL: z.enum(['fatal', 'error', 'warn', 'info', 'debug', 'trace', 'silent']).optional(),
+  // Set to 'false' to disable rate limiting (used when load-testing the booking
+  // path itself — the limiter is orthogonal to the concurrency we're stressing).
+  RATE_LIMIT_ENABLED: z.string().default('true').transform((v) => v.toLowerCase() !== 'false'),
+  // Which concurrency-control strategy the booking flow uses (Phase 4). Lets us
+  // benchmark the three approaches by flipping one env var.
+  LOCK_STRATEGY: z.enum(['pessimistic', 'optimistic', 'redis']).default('pessimistic'),
 });
 
 const parsed = envSchema.safeParse(process.env);
