@@ -109,9 +109,57 @@ For the *why* behind decisions, see the "Architecture Decisions" sections in [RE
 
 ---
 
-## Phase 4 — Concurrency (the differentiator) — ⬜ NOT STARTED
-Reproduce the shipped race under load, fix 3 ways (pessimistic `SELECT FOR UPDATE` / optimistic `version` / Redis lock) + benchmark, partial unique index safety-net, idempotent payments. **All Phase 4 concurrency code is DJ's to write (rule 4).**
+## Phase 4 — Concurrency (the differentiator) — ✅ COMPLETE (quiz skipped per DJ)
+Reproduce the shipped race under load, fix 3 ways (pessimistic `SELECT FOR UPDATE` / optimistic `version` / Redis lock) + benchmark, partial unique index safety-net, idempotent payments. **All locking + idempotency code is DJ's to write (rule 4).** Claude does a/e/f (load test, safety-net migration, benchmark+ADR).
+
+### (a) Reproduce the double-booking — 🔸 (Claude; verified)
+**Files:** `scripts/load-test.ts` (new), `src/config/env.ts` (`RATE_LIMIT_ENABLED`), `src/middlewares/rateLimit.ts` (bypass when disabled).
+- Load script fires N concurrent single-passenger bookings for the same train/date/class and detects how many CONFIRMED passengers share a seat. Run with `RATE_LIMIT_ENABLED=false` (limiter is orthogonal and would mask the race).
+- **Result (baseline / "before"):** 30 concurrent 1A bookings on a fresh date → **30/30 CONFIRMED, all on seat `H1/1 LOWER`** — one seat sold 30×. Goes in the README benchmark table at step (f).
+
+### (b) Pessimistic locking — 🔸 (written by Claude at DJ's insistence, TODO(DJ) marker; verified)
+**Files:** `src/domain/allocation.ts` (new — pure `allocatePassengers` core extracted), `src/services/allocation.service.ts` (delegates to domain; now the NAIVE read path), `src/repositories/allocation.repository.ts` (reads accept a tx client), `src/repositories/booking.repository.ts` (`createBookingWithLock`), `src/services/booking.service.ts` (create uses the locked path).
+- Locks all train+class seat rows `FOR UPDATE` (raw SQL, ascending id → deadlock-free) at the start of the booking tx, then re-reads occupancy and allocates + writes inside the same tx.
+- **Result:** 30 concurrent 1A bookings → 18 CONFIRMED (= capacity) + 12 WAITLISTED, **0 double-booking** (was 30× on one seat). Latency 599ms→2590ms (serialization cost — goes in the benchmark).
+
+### (c) Optimistic locking — 🔸 (written by Claude at DJ's insistence, TODO(DJ) marker; verified)
+**Files:** `src/config/env.ts` (`LOCK_STRATEGY` env), `src/services/booking.service.ts` (strategy dispatch), `src/repositories/allocation.repository.ts` (RAC reads now expose `version`), `src/repositories/booking.repository.ts` (`createBookingOptimistic`).
+- No upfront lock: read seats + `version` in ONE `RepeatableRead` snapshot, allocate, then guard each claimed seat with a raw `UPDATE seats SET version=version+1 WHERE id=? AND version=?`; 0 rows ⇒ lost the race ⇒ retry (jittered, max 5) ⇒ 409 `SEAT_CONTENTION`.
+- **Two bugs found + fixed during verification:** (1) Prisma `updateMany` lost the version predicate → switched to raw `$executeRaw`; (2) snapshot skew — `findFreeSeats`' two internal queries straddled a competitor's commit, reporting a seat free with an already-incremented version → wrapped reads in a `RepeatableRead` tx. `seats.id` is TEXT not uuid (no `::uuid` cast).
+- **Result:** 30 concurrent 1A → 6 CONFIRMED (distinct) + 24×409, **0 double-booking**. High 409 rate is the optimistic tradeoff under heavy contention (vs pessimistic filling all 18) — goes in the benchmark.
+- Switch strategies via `LOCK_STRATEGY=pessimistic|optimistic`.
+
+### (d) Redis distributed lock — 🔸 (written by Claude at DJ's insistence, TODO(DJ) marker; verified)
+**Files:** `src/utils/redisLock.ts` (new), `src/repositories/booking.repository.ts` (`createBookingNoSeatLock`), `src/config/env.ts` (`redis` strategy), `src/services/booking.service.ts` (dispatch).
+- `withRedisLock(key, ttl, fn)`: `SET lock:booking:{train}:{date}:{class} {token} NX PX 5000` with bounded spin-acquire; release via compare-and-delete Lua (only the holder deletes). Inside the lock the write needs no DB lock (`createBookingNoSeatLock`).
+- **Result:** 30 concurrent 1A → 18 CONFIRMED + 12 WAITLISTED, **0 double-booking** (~2138ms). Coarse (whole-class) lock → clean serialization like pessimistic.
+- Documented limits: single-node Redis lock not bulletproof (TTL expiry mid-tx → DB safety net in step e); Redlock + Kleppmann-vs-antirez debate noted in the file.
+
+**Benchmark so far (30 concurrent 1A, 18 seats, fresh date):**
+| Strategy | CONFIRMED | Failures | ~Time |
+|---|---|---|---|
+| (before) none | 30 (all seat H1/1) | 0 | 599ms |
+| pessimistic | 18 + 12 WL | 0 | 2590ms |
+| optimistic | 6 | 24× 409 | 1568ms |
+| redis | 18 + 12 WL | 0 | 2138ms |
+
+### (e) Safety-net partial unique index — 🔸 (Claude; verified)
+**Files:** `prisma/schema.prisma` (denormalized `journeyDate` on BookingPassenger), `prisma/migrations/20260618100000_phase4_seat_safety_net/migration.sql`, `src/repositories/booking.repository.ts` (all create paths set `journeyDate`).
+- `CREATE UNIQUE INDEX … ON booking_passengers (seat_id, journey_date) WHERE status='CONFIRMED'` — DB-level guarantee a seat can't be confirmed twice per date. Partial: excludes RAC (shared berth) + WL/CANCELLED. `journey_date` denormalized (index must be single-table; a seat is reusable across dates).
+- DB was `migrate reset` (the load-test double-bookings would have violated the index). **Verified:** a manual duplicate-confirmed INSERT is rejected by the DB.
+- Note: a seat-unique violation surfaces as P2002 like a PNR collision; the create retry loop re-allocates on retry, so it degrades gracefully (no corruption). Could refine to inspect the constraint name.
+
+### (f) Benchmark + ADR — 🔸 (Claude)
+**Files:** `README.md` ("Architecture Decisions — Phase 4").
+- Documents the race + reproduction, READ COMMITTED rationale, all three fixes, the benchmark table, the safety net, the ADR (default = pessimistic + DB index; when to switch), and the 10k-users answer.
+
+### (g) Idempotent payments — 🔸 (written by Claude at DJ's insistence, TODO(DJ) marker; verified)
+**Files:** `src/validators/payment.validators.ts`, `src/repositories/payment.repository.ts`, `src/services/payment.service.ts` (marker), `src/controllers/payment.controller.ts`, `src/routes/payment.routes.ts`, `src/app.ts` (mount `/api/v1/payments`), `scripts/idempotency-test.ts`.
+- `POST /payments` with `Idempotency-Key` header (server charges the booking fare, not a client amount). key seen+terminal → replay; key+in-flight → 409 PROCESSING; new → insert PENDING (unique key) → execute → SUCCESS. Concurrent identical retries resolved by the unique `idempotency_key` index (one INSERT wins, loser reads winner).
+- **Verified:** replay returns same paymentId; missing key → 400; 8 concurrent retries → 1 payment + 7 replays + 1 PROCESSING (no double charge).
+
+Phase 4 quiz skipped per DJ. README "Architecture Decisions — Phase 4" covers everything incl. idempotency + transaction boundaries.
 
 ---
 
-*Last updated: 2026-06-17 — Phase 3 complete (step h).*
+*Last updated: 2026-06-19 — Phase 4 COMPLETE (step g: idempotent payments).*

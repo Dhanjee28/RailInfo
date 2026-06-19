@@ -291,3 +291,76 @@ A dedicated `migrate` compose service (built from the `builder` stage, so it has
 
 **Docs generated from the validators — they can't drift**
 `@asteasolutions/zod-to-openapi` builds the OpenAPI 3.0 spec from the *same* Zod schemas `validate()` enforces, served via Swagger UI at `/api/docs`. The `classType` enum, `passengers` max of 6, and password min-length appear in the docs automatically because they *are* the validation rules — there's no second hand-maintained description to fall out of sync.
+
+## Architecture Decisions — Phase 4 (Concurrency)
+
+Phase 1 shipped a deliberate check-then-act race. Phase 4 reproduces it under load, fixes it three ways, benchmarks them, and backs the whole thing with a database constraint. The `LOCK_STRATEGY` env (`pessimistic` | `optimistic` | `redis`) selects the strategy so all three stay in the codebase and can be benchmarked by flipping one variable.
+
+### The bug, reproduced
+
+`scripts/load-test.ts` fires N concurrent single-passenger bookings for the same train/date/class. With the naive flow (seat read and booking write in *separate* transactions), every request reads the same seats as free and picks the lowest-numbered one:
+
+> **30 concurrent bookings → 30 CONFIRMED passengers, all on seat `H1/1`.** One physical seat sold 30 times.
+
+Reproducing it under load — not just describing it — is the point. *"I shipped it, reproduced the race, then fixed it three ways and benchmarked"* is the story this phase exists to tell.
+
+### Why the race survives the default isolation level
+
+PostgreSQL defaults to **READ COMMITTED**. Each statement sees a fresh snapshot of committed data, but two transactions can both read "seat free" before either commits — nothing serializes the read against the other's pending write. `SERIALIZABLE` would also prevent it (by aborting one transaction with a serialization failure to retry), at the cost of retry-handling on every transaction. We instead control concurrency explicitly per the booking path.
+
+### The three fixes
+
+**1. Pessimistic locking — `SELECT … FOR UPDATE`**
+Inside the booking transaction, lock all of the class's seat rows `FOR UPDATE` (raw SQL — Prisma's query API can't express it) in ascending `id` order, *then* re-read occupancy and allocate. A competing booking blocks on the lock until the first commits, then re-checks and sees the seats taken. Consistent lock ordering prevents deadlocks; the post-lock re-read is essential because the world changed while you blocked. Cost: contended bookings serialize.
+
+**2. Optimistic locking — the `seats.version` column**
+No upfront lock. Read seats + their `version` in a single `RepeatableRead` snapshot, allocate, then guard each claimed seat with a raw `UPDATE seats SET version = version + 1 WHERE id = ? AND version = ?`. A 0-row result means someone bumped the version first → retry with jittered backoff, then 409. Two subtleties that cost real debugging:
+- Prisma's `updateMany` can compile to a select-then-update that drops the `version` predicate — the guard *must* be a raw conditional `UPDATE` so the check lives in the WHERE, where Postgres re-evaluates it after the row lock (EvalPlanQual).
+- The version must be read in the **same snapshot** as the freeness check. `findFreeSeats` runs two queries; without `RepeatableRead` a competitor can commit between them, making a seat look free with an already-incremented version — defeating the guard. *Optimistic locking is only as correct as the consistency of the snapshot you read your expected version from.*
+
+**3. Redis distributed lock**
+`SET lock:booking:{train}:{date}:{class} {token} NX PX 5000` before the booking flow; release with a compare-and-delete Lua script so only the holder can release (deleting a lock you no longer own — after your TTL expired — is the classic bug). Coarse-grained (whole class), so it serializes cleanly but kills per-seat parallelism. Honest limits: a single-node Redis lock isn't bulletproof (TTL expiry mid-transaction → two holders); multi-node correctness is Redlock, with the Kleppmann-vs-antirez debate (clock/GC-pause assumptions) worth knowing rather than pretending the lock is perfect.
+
+### Benchmark
+
+30 concurrent bookings, class 1A (18 physical seats, no RAC), fresh date:
+
+| Strategy | CONFIRMED | Other | Double-booked | ~Latency | Character |
+|---|---|---|---|---|---|
+| none (shipped bug) | 30 | — | **30 on one seat** | 0.6s | corrupt |
+| pessimistic | 18 | 12 WL | 0 | 2.6s | serializes, fills cleanly, no failures |
+| optimistic | 6 | 24× 409 | 0 | 1.6s | no lock waits, but retries exhaust under contention |
+| redis | 18 | 12 WL | 0 | 2.1s | coarse lock, clean serialization |
+
+The contention here is worst-case (every booking targets the lowest free seat). Optimistic shines when conflicts are *rare* (no lock waits) and degrades to wasted retries under a stampede — the opposite profile to pessimistic.
+
+### Safety net — partial unique index (defense in depth)
+
+```sql
+CREATE UNIQUE INDEX booking_passengers_seat_confirmed_unique
+  ON booking_passengers (seat_id, journey_date) WHERE status = 'CONFIRMED';
+```
+
+Even if every application-level lock has a bug, the database makes a confirmed double-booking **impossible** — the violation becomes a clean error instead of silent corruption (verified: a manual duplicate insert is rejected). It's partial on purpose: RAC is excluded because a side-lower berth is legitimately shared by two RAC passengers (that 2-cap stays in app logic), and WAITLISTED/CANCELLED rows hold no live seat. `journey_date` is denormalized onto the passenger row because the index must be single-table and a seat is reusable across dates. **App-level locks are for good UX (clean 409s, no lock storms); the constraint is for correctness. You want both.**
+
+### ADR — chosen default
+
+**Pessimistic locking + the DB unique index**, as the default `LOCK_STRATEGY`. Rationale: correct, simple to reason about, and fills inventory cleanly with zero spurious failures under contention — the right fit for a booking system where most contention is on popular trains. Switch to **optimistic** when contention is genuinely low (no lock waits is then pure win), and reach for the **Redis lock** only when coordination must span processes that don't share a database. The unique index stays on regardless — it's the backstop, not the strategy.
+
+### Idempotent payments
+
+`POST /payments` carries an `Idempotency-Key` header so a client retry — after a network failure that dropped the *response* but not the *charge* — never charges twice. The logic:
+
+- key seen + terminal → **replay** the stored result (same `paymentId`, no re-charge)
+- key seen + in-flight → **409 PROCESSING** (retry later)
+- key new → insert a PENDING row keyed by the idempotency key, "execute", store SUCCESS
+
+The interesting race is *within* idempotency: two identical retries arrive at once, both find no existing key, both try to insert. The **unique `payments.idempotency_key` index** (shipped unused in Phase 1) resolves it — one INSERT wins, the loser catches the unique violation and reads the winner's row instead of charging again. Verified: 8 simultaneous retries → 1 payment created, 7 replayed SUCCESS + 1 PROCESSING, never two charges. *"The network fails after the server succeeds but before the client hears — retries without idempotency mean double charges"* is the distributed-payments answer this demonstrates.
+
+### Transaction boundaries
+
+A transaction spans exactly one logical operation (booking creation, the promotion chain) and never wraps an external call. The mock payment "executes" outside the insert/settle so a slow or failing gateway can't hold a DB transaction (and row locks) open — the real-world version of this rule is what prevents a payment provider's latency from cascading into lock contention.
+
+### The "10,000 users book the same seat" answer
+
+Rate limiter sheds abusive load → requests serialize on the seat-row lock → one winner commits → the rest get instant, clean 409s re-checked against real availability → the DB unique index guarantees no corruption even if the app logic is buggy → (future) a queue / virtual waiting room smooths the spike further.
