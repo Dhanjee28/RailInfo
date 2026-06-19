@@ -1,6 +1,3 @@
-// TODO(DJ): rewrite this yourself before interviews.
-// The pure algorithm now lives in src/domain/allocation.ts; this service is the
-// NAIVE (unlocked) read path — kept for unit tests and comparison. The Phase-4
 // booking flow uses bookingRepository.createBookingWithLock instead.
 import { ClassType } from '@prisma/client';
 import { allocationRepository } from '../repositories/allocation.repository';

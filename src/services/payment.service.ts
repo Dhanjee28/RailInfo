@@ -1,7 +1,3 @@
-// TODO(DJ): rewrite this yourself before interviews.
-// Phase 4 — IDEMPOTENT PAYMENTS. This is THE distributed-payments interview
-// question: a network can fail AFTER the server charged but BEFORE the client
-// hears back, so clients retry — and a retry must NOT charge twice.
 import { Payment, PaymentStatus, Prisma } from '@prisma/client';
 import { bookingRepository } from '../repositories/booking.repository';
 import { paymentRepository } from '../repositories/payment.repository';

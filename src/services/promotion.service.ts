@@ -1,8 +1,3 @@
-// TODO(DJ): rewrite this yourself before interviews.
-// Interviewers will ask you: "what happens when a confirmed passenger cancels?"
-// Walk them through the three-level cascade: CNF frees a seat → top RAC gets it
-// → top WL fills the vacated RAC berth slot. Then the RAC/WL-only cases.
-// You also need to explain why this runs *inside* the cancel transaction.
 import { BerthType, ClassType, PassengerStatus, Prisma } from '@prisma/client';
 import { PassengerStateMachine } from './passengerStateMachine';
 import { logger } from '../utils/logger';

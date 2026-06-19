@@ -1,5 +1,3 @@
-// TODO(DJ): rewrite create() and cancel() yourself before interviews.
-// These are the methods interviewers will ask you to walk through line by line.
 import { BerthType, BookingStatus, ClassType, Gender, PassengerStatus } from '@prisma/client';
 import { PrismaClientKnownRequestError } from '@prisma/client/runtime/library';
 import { z } from 'zod';

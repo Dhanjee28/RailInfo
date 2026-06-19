@@ -1,14 +1,3 @@
-// TODO(DJ): rewrite this yourself before interviews.
-// Phase 4 — REDIS DISTRIBUTED LOCK. Coarse-grained mutual exclusion across
-// instances for one (train, date, class). Acquire with SET NX PX, release with
-// a compare-and-delete Lua script so only the holder can release.
-//
-// Honest limits to state in interviews: a single-node Redis lock is NOT
-// bulletproof — if the booking outlives the TTL the lock expires and a second
-// holder can enter (hence the DB unique-index safety net in step e). Multi-node
-// correctness is the Redlock algorithm, which Kleppmann famously criticised
-// (clock assumptions, GC pauses) vs antirez's defence. Knowing the debate beats
-// pretending the lock is perfect.
 import crypto from 'crypto';
 import { redis } from '../config/redis';
 import { ConflictError } from '../errors/AppError';
